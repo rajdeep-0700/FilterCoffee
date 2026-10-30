@@ -6,6 +6,8 @@ const state = {
   busy: false,
   active: null,
   viewing: null,
+  sessionId: null,
+  sessionRuns: [],
   timer: null,
   toast: null,
   countryNames: new Map(),
@@ -152,7 +154,7 @@ function scopeChanged() {
   $("browser").disabled = mode === "manual" || mode === "sources";
   if (mode !== "sources") $("opencli").checked = false;
   const help = {
-    auto: "Look up a page or video, or compare products across relevant websites.",
+    auto: "Look up a page or video, or compare results across relevant websites.",
     sources:
       "Search the chosen sources and combine their hits into one result. YouTube runs separately.",
     url: "Read one public page or video. URLs and redirects still pass through the existing safety checks.",
@@ -304,7 +306,19 @@ function renderJob(job) {
     note.append(
       node(
         "p",
-        `${coverage.searches + coverage.fetches} / ${coverage.limit} search/page requests · ${coverage.domains.length} websites · ${state.countryNames.get(coverage.country) || coverage.country || "Market unspecified"}`,
+        `${coverage.searches + coverage.fetches} / ${coverage.limit} requests · ${coverage.domains.length} websites · ${state.countryNames.get(coverage.country) || coverage.country || "Market unspecified"}`,
+      ),
+    );
+    note.append(
+      node(
+        "p",
+        "Search breakdown: " +
+          coverage.searches +
+          " searches · " +
+          coverage.fetches +
+          " pages · " +
+          (coverage.discovery_searches || 0) +
+          " broad searches",
       ),
     );
     if (coverage.partial) note.append(node("p", coverage.stop_reason));
@@ -591,33 +605,94 @@ function renderEvidence(items) {
     $("evidence").append(details);
   });
 }
+function renderSessionTurns(runs) {
+  const nav = $("session-turns");
+  nav.replaceChildren();
+  nav.hidden = runs.length < 2;
+  runs.forEach((run, index) => {
+    const button = node(
+      "button",
+      null,
+      "session-turn" + (run.id === state.viewing ? " active" : ""),
+    );
+    const count = run.result?.items?.length || 0;
+    button.append(
+      node("span", "Turn " + (run.turn || index + 1), "session-turn-number"),
+      node("span", run.request, "session-turn-request"),
+      node(
+        "small",
+        run.status + " · " + count + (count === 1 ? " result" : " results"),
+      ),
+    );
+    button.setAttribute("aria-current", String(run.id === state.viewing));
+    button.addEventListener("click", () => {
+      state.viewing = run.id;
+      clearResult();
+      showView("response");
+      renderJob(run);
+      renderSessionTurns(state.sessionRuns);
+    });
+    nav.append(button);
+  });
+}
+
+async function openSession(sessionId, runId = null) {
+  const saved = await api("/api/sessions/" + sessionId);
+  state.sessionId = sessionId;
+  state.sessionRuns = saved.runs;
+  const selected = runId && saved.runs.find((run) => run.id === runId);
+  const run = selected || saved.runs.at(-1);
+  const savedCountry = run?.result?.research?.country || run?.country || "";
+  const countryEntry = Array.from(state.countryNames.entries()).find(
+    ([code, name]) =>
+      code === savedCountry ||
+      name.toLowerCase() === savedCountry.toLowerCase(),
+  );
+  $("country").value = countryEntry?.[0] || "";
+  scopeChanged();
+  renderSessionTurns(saved.runs);
+  if (run) {
+    clearResult();
+    showView("response");
+    renderJob(run);
+    renderSessionTurns(saved.runs);
+  } else {
+    state.viewing = null;
+    $("welcome").hidden = false;
+    $("run-heading").hidden = true;
+  }
+  return saved;
+}
+
 async function loadHistory() {
-  const jobs = await api("/api/history");
+  const sessions = await api("/api/history");
   $("history").replaceChildren();
-  if (!jobs.length)
+  if (!sessions.length)
     $("history").append(node("p", "Your research will appear here.", "subtle"));
-  jobs.forEach((job) => {
+  sessions.forEach((session) => {
     const row = node("div", null, "history-entry");
     const button = node(
       "button",
       null,
-      "history" + (job.id === state.viewing ? " active" : ""),
+      "history" + (session.id === state.sessionId ? " active" : ""),
     );
-    const text = node("span", job.request);
+    const text = node("span", session.request);
     text.append(
       node(
         "time",
-        new Date(job.created * 1000).toLocaleDateString() + " · " + job.status,
+        new Date(session.updated * 1000).toLocaleDateString() +
+          " · " +
+          session.turn_count +
+          (session.turn_count === 1 ? " turn" : " turns") +
+          " · " +
+          session.status,
       ),
     );
     button.append(icon("chat"), text);
-    button.title = job.request;
+    button.title = session.request;
     button.addEventListener("click", async () => {
       try {
-        const saved = await api("/api/runs/" + job.id);
-        clearResult();
-        showView("response");
-        renderJob(saved);
+        await openSession(session.id);
         await loadHistory();
       } catch (error) {
         notify(error.message);
@@ -627,24 +702,26 @@ async function loadHistory() {
     remove.append(icon("trash"));
     remove.setAttribute("aria-label", "Delete session");
     remove.title =
-      job.status === "running"
-        ? "Wait for this run to finish before deleting it."
-        : "Delete saved session";
-    remove.disabled = job.status === "running";
+      session.status === "running"
+        ? "Wait for this session to finish before deleting it."
+        : "Delete saved session and all its turns";
+    remove.disabled = session.status === "running";
     remove.addEventListener("click", async () => {
       if (
-        !window.confirm(
-          "Delete this saved session and its result from history?",
-        )
+        !window.confirm("Delete this session and all of its turns and results?")
       )
         return;
       remove.disabled = true;
       try {
-        await api("/api/runs/" + job.id, undefined, "DELETE");
-        if (state.viewing === job.id) {
+        await api("/api/sessions/" + session.id, undefined, "DELETE");
+        if (state.sessionId === session.id) {
           state.job = null;
+          state.sessionId = null;
+          state.sessionRuns = [];
           state.viewing = null;
           clearResult();
+          $("session-turns").replaceChildren();
+          $("session-turns").hidden = true;
           $("welcome").hidden = false;
           $("run-heading").hidden = true;
           $("run-status").hidden = true;
@@ -663,7 +740,7 @@ async function loadHistory() {
     row.append(button, remove);
     $("history").append(row);
   });
-  return jobs;
+  return sessions;
 }
 async function poll() {
   if (!state.active) return;
@@ -674,6 +751,9 @@ async function poll() {
     else {
       state.active = null;
       setBusy(false);
+      if (state.sessionId === job.session_id) {
+        await openSession(job.session_id, job.id);
+      }
       await loadHistory();
     }
   } catch (error) {
@@ -692,6 +772,7 @@ async function submit(event) {
   const mode = $("mode").value;
   const payload = {
     request: $("request").value.trim(),
+    session_id: state.sessionId,
     mode,
     country: $("country").value.trim(),
     max_items: Number($("max-items").value),
@@ -726,9 +807,10 @@ async function submit(event) {
     setBusy(true);
     const job = await api("/api/runs", payload);
     state.active = job.id;
+    state.sessionId = job.session_id;
     clearResult();
     showView("response");
-    renderJob(job);
+    await openSession(job.session_id, job.id);
     $("request").value = "";
     document.querySelector(".workspace").classList.remove("menu-open");
     $("menu-toggle").setAttribute("aria-expanded", "false");
@@ -856,7 +938,11 @@ document.querySelectorAll("[data-example]").forEach((button) =>
 );
 $("new-run").addEventListener("click", () => {
   state.job = null;
+  state.sessionId = null;
+  state.sessionRuns = [];
   state.viewing = null;
+  $("session-turns").replaceChildren();
+  $("session-turns").hidden = true;
   clearResult();
   $("welcome").hidden = false;
   $("run-heading").hidden = true;
@@ -992,13 +1078,27 @@ async function boot() {
         "Set OPENROUTER_KEY and GEMINI_KEY in the project's .env before starting research. Do not put API keys in the chat.";
       $("error").hidden = false;
     }
-    const jobs = await loadHistory();
-    const active = jobs.find((job) => job.status === "running");
-    if (active) {
-      state.active = active.id;
-      state.viewing = active.id;
-      setBusy(true);
-      await poll();
+    const sessions = await loadHistory();
+    const activeSession = sessions.find(
+      (session) => session.status === "running",
+    );
+    if (activeSession) {
+      const saved = await api("/api/sessions/" + activeSession.id);
+      state.sessionId = activeSession.id;
+      state.sessionRuns = saved.runs;
+      renderSessionTurns(saved.runs);
+      const activeRun = saved.runs.find((run) => run.status === "running");
+      if (activeRun) {
+        state.active = activeRun.id;
+        state.viewing = activeRun.id;
+        setBusy(true);
+        renderJob(activeRun);
+        await poll();
+      } else if (saved.runs.length) {
+        // A process restart interrupted the in-flight turn; reopen the last saved turn.
+        await openSession(activeSession.id);
+        await loadHistory();
+      }
     }
   } catch (error) {
     $("connection").textContent = "Disconnected";

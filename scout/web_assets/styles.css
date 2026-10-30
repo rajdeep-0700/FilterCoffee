@@ -224,6 +224,41 @@ select:focus-visible {
   min-height: 0;
   overflow: hidden;
 }
+.session-turns {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding: 0 clamp(26px, 5vw, 72px) 12px;
+  scrollbar-gutter: stable;
+}
+.session-turn {
+  display: grid;
+  gap: 3px;
+  flex: 0 0 min(260px, 38vw);
+  min-width: 0;
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--card);
+  color: var(--muted);
+  text-align: left;
+}
+.session-turn:hover,
+.session-turn.active {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
+  color: var(--text);
+}
+.session-turn-number,
+.session-turn small {
+  color: var(--muted);
+  font-size: 10px;
+}
+.session-turn-request {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
 .left,
 .right {
   background: var(--panel);
@@ -1178,12 +1213,6 @@ textarea::placeholder {
   border-left: 2px solid var(--line);
   padding-left: 9px;
 }
-.local-note {
-  font-size: 10px;
-  color: var(--muted);
-  line-height: 1.8;
-  margin-top: 28px;
-}
 code {
   font-family: Consolas, monospace;
   font-size: inherit;
@@ -1279,9 +1308,6 @@ code {
   .left {
     grid-row: 1 / span 2;
   }
-  .local-note {
-    max-width: 480px;
-  }
 }
 @media (max-width: 720px) {
   html {
@@ -1335,6 +1361,12 @@ code {
   }
   .tabs {
     padding: 0 20px;
+  }
+  .session-turns {
+    padding: 0 20px 12px;
+  }
+  .session-turn {
+    flex-basis: 70vw;
   }
   .question {
     font-size: 21px;

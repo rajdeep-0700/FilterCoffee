@@ -15,8 +15,6 @@ data/
 .pytest_cache/
 .ruff_cache/
 .serena/
+# Local tests and fixtures (kept on disk, not tracked)
 tests/
-!tests/
-tests/*
-!tests/test_web_ui.py
-!tests/test_product_research.py
+fixtures/

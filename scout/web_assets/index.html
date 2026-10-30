@@ -119,10 +119,6 @@
           <select id="country">
             <option value="">Any country</option>
           </select>
-          <p class="subtle">
-            Product comparisons: up to 15 sites and 200 search/page requests.
-            Requests and page text are sent to Gemini and TinyFish.
-          </p>
           <p class="subtle" id="scope-help">
             FilterCoffee finds one relevant page or video. Mention YouTube in
             your request to search for a video.
@@ -347,6 +343,12 @@
             <div class="query-meta" id="query-meta"></div>
             <div class="rule"></div>
           </div>
+          <nav
+            id="session-turns"
+            class="session-turns"
+            aria-label="Turns in this session"
+            hidden
+          ></nav>
           <div id="run-status" role="status" aria-live="polite" hidden></div>
           <div id="error" class="error-box" role="alert" hidden></div>
           <section
@@ -417,7 +419,6 @@
           <summary>Model calls &amp; warnings</summary>
           <div id="diagnostic-content"></div>
         </details>
-        <p class="local-note">History is stored locally.</p>
       </aside>
     </div>
     <footer class="statusbar">

@@ -21,7 +21,7 @@ For a plain-language product comparison request, classify its scope and criteria
 - Nemotron: exactly two calls on a successful product-research run—request distillation, final presentation. No implicit planning/repair/retry calls to Nemotron.
 - Gemini: owns bounded research planning, search iteration, product extraction, comparisons, and partial-result synthesis. Its limits must be explicit and partial results reported on exhaustion.
 - TinyFish: Search/Fetch only; backend-owned, validated tool execution. Count successful and failed attempts toward the shared 200-call run budget.
-- Search bounds: no more than 20 broad domain-discovery searches; no more than two targeted searches per selected domain; no more than 10 fetched listing pages per domain. This arithmetic fits the 200-call maximum at 15 domains.
+- Search bounds: at least 10 and at most 20 broad domain-discovery searches for open-web product research, continuing until three consecutive queries reveal no new domains; no more than two targeted searches per selected domain; no more than 10 fetched listing pages per domain. This arithmetic fits the 200-call maximum at 15 domains.
 - User-facing bounds: up to 15 relevant domains and up to 10 qualifying products per domain; fewer are valid. Never pad with irrelevant domains or non-matches.
 - Scope precedence: URL starts within its same main domain and subdomains; named retailer stays on that site; otherwise open-web discovery. Explicit country selection overrides country stated in the request. A country-domain variant is a separate market.
 - Hard constraints (including budget) exclude a product when contradicted or unknown. Preferences only affect ranking among qualifying candidates.

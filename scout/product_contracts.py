@@ -104,6 +104,7 @@ class ResearchAction(StrictModel):
 
 class ResearchTurn(StrictModel):
     actions: list[ResearchAction] = Field(default_factory=list, max_length=10)
+    dismissed_domains: list[str] = Field(default_factory=list, max_length=30)
     candidates: list[ProductCandidate] = Field(default_factory=list, max_length=20)
     done: bool = False
 

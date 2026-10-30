@@ -10,6 +10,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from tldextract import TLDExtract
@@ -273,6 +274,7 @@ class ProductResearch:
         emit: Callable[[str, str], None],
         resolver: Resolver = resolve_host,
         clock: Callable[[], float] = time.monotonic,
+        session_context: dict | None = None,
     ):
         self.plan, self.gemini, self.nemotron, self.tinyfish = plan, gemini, nemotron, tinyfish
         self.robots_check, self.emit, self.resolver, self.clock = (
@@ -284,15 +286,17 @@ class ProductResearch:
         self.budget = ResearchBudget()
         self.started = clock()
         self.domains: dict[str, dict] = {}
+        self.dismissed_domains: set[str] = set()
         self.known: dict[str, dict] = {}
         self.pages: dict[str, dict] = {}
         self.attempted: set[str] = set()
         self.queries: set[tuple[str, str]] = set()
-        self.search_log: list[dict[str, str]] = []
+        self.search_log: list[dict[str, Any]] = []
         self.candidates: dict[str, dict] = {}
         self.excluded: list[dict] = []
         self.warnings: list[str] = []
         self.discovery_searches = 0
+        self.discovery_stagnation = 0
         self.gemini_calls = 0
         self.input_chars = 0
         self.output_tokens = 0
@@ -300,6 +304,7 @@ class ProductResearch:
         self.stop_reason = "completed"
         self.partial = False
         self.scope_domain = domain_key(plan.url) if plan.scope == "url" else ""
+        self.session_context = session_context or {}
         self.location = country_location(plan.country)
         if plan.country and not self.location:
             self.warnings.append(
@@ -351,7 +356,8 @@ class ProductResearch:
                 raise ValueError("Expected a domain, not a URL.")
             requested_domain = domain_key("https://" + domain)
             discovered = any(domain_key(url) == requested_domain for url in self.known)
-            if discovered:
+            force_broad_discovery = self.plan.scope == "web" and self.discovery_searches < 10
+            if discovered and not force_broad_discovery:
                 domain = requested_domain
                 requested_domain = ""
             elif self.scope_domain:
@@ -399,6 +405,7 @@ class ProductResearch:
         if domain:
             self.domains[domain]["queries"].append(submitted_query)
         self.emit("Searching products", domain or "Discovering relevant websites")
+        known_domains_before = {item["domain"] for item in self.known.values()}
         found = self.tinyfish.search(
             submitted_query,
             include_domains=[domain] if domain else None,
@@ -425,9 +432,10 @@ class ProductResearch:
                 rows.append(self.known[url])
         # A broad search requested for an unverified target still counts as a site-search
         # slot only if its actual results prove that the site is relevant.
-        if requested_domain and any(row["domain"] == requested_domain for row in rows):
-            report = self._admit(requested_domain)
-            report["searches"] += 1
+        if not domain:
+            new_domains = {row["domain"] for row in rows} - known_domains_before
+            self.discovery_stagnation = 0 if new_domains else self.discovery_stagnation + 1
+            self.search_log[-1]["new_domains"] = len(new_domains)
         return {"operation": "search", "results": rows}
 
     def fetch(self, url: str) -> dict:
@@ -556,13 +564,64 @@ class ProductResearch:
             **{k: v for k, v in page.items() if k != "text"},
         }
 
+    def _unreviewed_domains(self) -> list[str]:
+        found = {candidate["domain"] for candidate in self.known.values()}
+        searched = {
+            domain for domain, report in self.domains.items() if report.get("searches", 0) > 0
+        }
+        reviewed = searched | self.dismissed_domains
+        if self.scope_domain:
+            reviewed.add(self.scope_domain)
+        return sorted(found - reviewed)
+
+    def _completion_requirements(self) -> list[str]:
+        requirements = []
+        if self.plan.scope == "web" and self.discovery_searches < 10:
+            requirements.append(
+                f"Complete at least 10 broad discovery searches ({self.discovery_searches}/10)."
+            )
+        elif (
+            self.plan.scope == "web"
+            and self.discovery_searches < 20
+            and len(self.domains) < 15
+            and self.discovery_stagnation < 3
+        ):
+            requirements.append(
+                "Continue varied broad searches until three consecutive searches add no new "
+                "retailer domain, or the 20-search/15-domain limit is reached."
+            )
+        if self.plan.scope == "site" and not self.scope_domain:
+            requirements.append("Discover and verify the named website before finishing.")
+        if self.plan.scope == "site" and self.scope_domain:
+            report = self.domains.get(self.scope_domain, {})
+            if report.get("searches", 0) < 2:
+                requirements.append("Run a second distinct search on the named site.")
+        for domain, report in self.domains.items():
+            if domain not in self.dismissed_domains and report.get("searches", 0) == 1:
+                requirements.append("Run a second distinct search on " + domain + ".")
+        if len(self.domains) < 15 and self._unreviewed_domains():
+            requirements.append(
+                "Review discovered websites: search each relevant site or list irrelevant "
+                "ones in dismissed_domains."
+            )
+        return requirements
+
     def _turn(self) -> ResearchTurn:
         payload = {
             "plan": self.plan.model_dump(),
+            "prior_session_context": self.session_context,
             "scope_domain": self.scope_domain,
-            "usage": {"searches": self.budget.searches, "fetches": self.budget.fetches},
+            "usage": {
+                "searches": self.budget.searches,
+                "fetches": self.budget.fetches,
+                "broad_discovery_searches": self.discovery_searches,
+                "consecutive_no_new_domains": self.discovery_stagnation,
+            },
             "domains": list(self.domains.values()),
             "discovered_candidates": list(self.known.values()),
+            "unreviewed_domains": self._unreviewed_domains(),
+            "dismissed_domains": sorted(self.dismissed_domains),
+            "completion_requirements": self._completion_requirements(),
             "observations": self.last_results,
             "pages": [
                 {k: v for k, v in page.items() if k != "text"} for page in self.pages.values()
@@ -602,17 +661,52 @@ class ProductResearch:
                 turn = self._turn()
                 for candidate in turn.candidates:
                     self.accept(candidate)
-                before = (len(self.known), len(self.pages), len(self.candidates))
+                before = (
+                    len(self.known),
+                    len(self.pages),
+                    len(self.candidates),
+                    self.budget.searches,
+                    self.discovery_stagnation,
+                    len(self.dismissed_domains),
+                )
                 self.last_results = []
                 action_failed = False
+                for requested in turn.dismissed_domains:
+                    try:
+                        if "://" in requested or "/" in requested or " " in requested:
+                            raise ValueError("Dismiss a discovered domain name, not a URL.")
+                        domain = domain_key("https://" + requested)
+                        if not any(item["domain"] == domain for item in self.known.values()):
+                            raise ValueError("Only discovered domains may be dismissed.")
+                        if domain == self.scope_domain and self.plan.scope in {"site", "url"}:
+                            raise ValueError("The user-selected website cannot be dismissed.")
+                        self.dismissed_domains.add(domain)
+                    except (ScoutError, ValueError) as error:
+                        action_failed = True
+                        self.partial = True
+                        self.warnings.append(str(error))
+                actions_executed = 0
                 for action in turn.actions:
+                    if (
+                        action.operation == "search"
+                        and not action.domain
+                        and self.plan.scope == "web"
+                        and self.discovery_searches >= 10
+                        and self.discovery_stagnation >= 3
+                        and len(self.domains) < 15
+                    ):
+                        self.last_results.append(
+                            {
+                                "notice": (
+                                    "Broad discovery is saturated; review known domains instead."
+                                )
+                            }
+                        )
+                        continue
+                    actions_executed += 1
                     try:
                         if action.operation == "search":
-                            # Resolve a named retailer once using a search, then lock to an
-                            # observed domain selected by Gemini, never an invented URL.
                             if self.plan.scope == "site" and not self.scope_domain:
-                                if self.discovery_searches >= 2:
-                                    raise ValueError("Select the named site's domain from results.")
                                 if action.domain:
                                     chosen = domain_key("https://" + action.domain)
                                     if any(domain_key(u) == chosen for u in self.known):
@@ -649,21 +743,30 @@ class ProductResearch:
                             )
                         ):
                             raise TimeoutError(message) from error
-                after = (len(self.known), len(self.pages), len(self.candidates))
+                after = (
+                    len(self.known),
+                    len(self.pages),
+                    len(self.candidates),
+                    self.budget.searches,
+                    self.discovery_stagnation,
+                    len(self.dismissed_domains),
+                )
                 idle = idle + 1 if before == after else 0
-                if turn.done and not turn.actions and not action_failed:
+                if turn.done and not actions_executed and not action_failed:
                     pending = [
                         url
                         for url, result in self.known.items()
                         if result["domain"] in self.domains
-                        and self.domains[result["domain"]]["searches"] > 0
+                        and (
+                            self.domains[result["domain"]]["searches"] > 0
+                            or result["domain"] == self.scope_domain
+                        )
                         and self.domains[result["domain"]]["fetches"] < 10
                         and url not in self.attempted
                     ]
                     if pending:
-                        # A relevant domain's search results are not evidence until its
-                        # actual candidate pages have been inspected. Drain in bounded
-                        # batches, then let Gemini evaluate the new page content.
+                        # Search snippets are discovery only. Inspect every known candidate
+                        # in selected domains, in bounded batches, before accepting done.
                         self.last_results = []
                         for url in pending[:5]:
                             try:
@@ -673,8 +776,12 @@ class ProductResearch:
                                 self.last_results.append({"error": message})
                                 self.warnings.append(message)
                                 self.partial = True
+                                action_failed = True
                                 if self.stop_reason == "completed":
                                     self.stop_reason = "Some listing pages could not be checked."
+                                if self.budget.searches + self.budget.fetches >= 200:
+                                    self.stop_reason = "200 combined TinyFish attempts reached."
+                                    break
                                 if any(
                                     word in message.lower()
                                     for word in (
@@ -688,6 +795,19 @@ class ProductResearch:
                                     break
                         if any(item.get("operation") == "fetch" for item in self.last_results):
                             continue
+                    requirements = self._completion_requirements()
+                    if requirements:
+                        self.last_results = [
+                            {"notice": "Coverage is not complete.", "requirements": requirements}
+                        ]
+                        if idle >= 3:
+                            self.partial = True
+                            self.stop_reason = (
+                                "Stopped before required research coverage was complete."
+                            )
+                            self.warnings.append(self.stop_reason)
+                            break
+                        continue
                     if self.known and not self.pages:
                         self.partial = True
                         self.stop_reason = (
@@ -810,6 +930,7 @@ class ProductResearch:
             "preferences": self.plan.preferences,
             "searches": self.budget.searches,
             "discovery_searches": self.discovery_searches,
+            "discovery_stagnation": self.discovery_stagnation,
             "search_queries": self.search_log,
             "fetches": self.budget.fetches,
             "limit": 200,

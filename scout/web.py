@@ -105,12 +105,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, capabilities())
             elif path == "/api/history":
                 self._json(200, self.app.store.history())
+            elif path.startswith("/api/sessions/"):
+                self._json(200, self.app.store.get_session(path.rsplit("/", 1)[-1]))
             elif path.startswith("/api/runs/"):
                 self._json(200, self.app.store.get(path.rsplit("/", 1)[-1]))
             else:
                 self._json(404, {"error": "Not found."})
         except KeyError:
-            self._json(404, {"error": "That saved run is no longer available."})
+            self._json(404, {"error": "That saved session is no longer available."})
         except Exception:
             self._json(500, {"error": "Could not read workspace data. Check your local setup."})
 
@@ -140,6 +142,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, quota_status())
             else:
                 self._json(404, {"error": "Not found."})
+        except KeyError:
+            self._json(404, {"error": "That session no longer exists."})
         except ValidationError as error:
             # Pydantic's raw error includes input values; do not echo file contents.
             message = "; ".join(str(item["msg"]) for item in error.errors(include_input=False))
@@ -157,15 +161,23 @@ class Handler(BaseHTTPRequestHandler):
         if not self._allowed(api=True):
             return
         path = urlsplit(self.path).path
-        if not path.startswith("/api/runs/"):
+        if path.startswith("/api/sessions/"):
+            entry_id = path.rsplit("/", 1)[-1]
+            entry_type = "session"
+        elif path.startswith("/api/runs/"):
+            entry_id = path.rsplit("/", 1)[-1]
+            entry_type = "run"
+        else:
             self._json(404, {"error": "Not found."})
             return
-        job_id = path.rsplit("/", 1)[-1]
-        if not job_id or "/" in job_id:
+        if not entry_id or "/" in entry_id:
             self._json(404, {"error": "Not found."})
             return
         try:
-            self.app.store.delete(job_id)
+            if entry_type == "session":
+                self.app.store.delete_session(entry_id)
+            else:
+                self.app.store.delete(entry_id)
         except KeyError:
             self._json(404, {"error": "That saved session no longer exists."})
             return

@@ -18,7 +18,7 @@ from tempfile import TemporaryDirectory
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
 from scout.browser import BrowserRenderer, CloakBrowserRenderer
 from scout.cache import Cache, digest
@@ -58,6 +58,8 @@ class WebRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     request: str = Field(min_length=1, max_length=6000)
+    session_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+    _session_context: dict[str, Any] = PrivateAttr(default_factory=dict)
     mode: Literal["auto", "sources", "url", "manual"] = "auto"
     country: str = Field(default="", max_length=80)
     sources: list[str] = Field(default_factory=list, max_length=7)
@@ -109,6 +111,10 @@ class WebRequest(BaseModel):
         elif self.content or self.filename:
             raise ValueError("Files require Import saved page mode.")
         return self
+
+    @property
+    def session_context(self) -> dict[str, Any]:
+        return self._session_context
 
 
 def opencli_environment(enabled: bool) -> dict[str, str]:
@@ -196,6 +202,15 @@ def current_usage(result: ExtractResult, client: LLMClient) -> dict[str, Any]:
     return result.model_dump(mode="json")
 
 
+def contextual_request(request: WebRequest) -> str:
+    if not request.session_context.get("turns"):
+        return request.request
+    return json.dumps(
+        {"current_request": request.request, "prior_session_context": request.session_context},
+        ensure_ascii=False,
+    )
+
+
 def execute_request(
     request: WebRequest, emit: Emit, *, cache_path: str | Path = "data/cache.db"
 ) -> dict[str, Any]:
@@ -222,7 +237,7 @@ def execute_request(
             stack.callback(registry.close)
             emit("Searching sources", ", ".join(request.sources))
             result = research(
-                request.request,
+                contextual_request(request),
                 settings=settings,
                 llm=client,
                 registry=registry,
@@ -255,7 +270,12 @@ def execute_request(
                 query = f"Search YouTube for a video: {query}"
             emit("Searching", "Finding a public page or video for your request.")
             cache = Cache(cache_path)
-            discovery_key = digest("discover:v2:" + " ".join(query.casefold().split()))
+            discovery_context = json.dumps(
+                request.session_context, sort_keys=True, ensure_ascii=False
+            )
+            discovery_key = digest(
+                "discover:v3:" + " ".join(query.casefold().split()) + ":" + discovery_context
+            )
             saved = None if request.refresh else cache.get_discovery(discovery_key)
             if saved:
                 url = saved["url"]
@@ -273,6 +293,7 @@ def execute_request(
                     llm=client,
                     search_provider="auto",
                     allow_product_research=request.mode in {"auto", "url"},
+                    session_context=request.session_context,
                 )
                 if discovery.product_research is not None:
                     product_plan = discovery.product_research.model_copy(deep=True)
@@ -292,6 +313,7 @@ def execute_request(
                         robots_check=checker.check_robots,
                         resolver=tiny.resolver,
                         emit=emit,
+                        session_context=request.session_context,
                     ).run(request.request)
                 url, instruction = discovery.url, discovery.instruction
                 emit("Selected source", f"{discovery.title or url} · {url}")
@@ -357,7 +379,11 @@ def execute_request(
 
 
 class JobStore:
-    """One active run at a time; the most recent 30 completed runs stay on disk."""
+    """Persist research runs grouped into resumable local sessions."""
+
+    _SESSION_LIMIT = 30
+    _CONTEXT_TURNS = 8
+    _CONTEXT_CHARS = 24000
 
     def __init__(self, path: str | Path, *, runner: Callable[..., dict] = execute_request):
         self.path = Path(path)
@@ -368,16 +394,115 @@ class JobStore:
         self.worker: threading.Thread | None = None
         with closing(sqlite3.connect(self.path)) as db, db:
             db.execute("CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, data TEXT NOT NULL)")
+            columns = {row[1] for row in db.execute("PRAGMA table_info(runs)")}
+            if "session_id" not in columns:
+                db.execute("ALTER TABLE runs ADD COLUMN session_id TEXT")
+            db.execute("CREATE INDEX IF NOT EXISTS runs_session ON runs(session_id)")
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, data TEXT NOT NULL)"
+            )
+            self._migrate_runs(db)
+            self._prune_sessions(db)
+
+    def _migrate_runs(self, db: sqlite3.Connection) -> None:
+        rows = db.execute("SELECT id, data, session_id FROM runs").fetchall()
+        for run_id, raw, stored_session_id in rows:
+            job = json.loads(raw)
+            session_id = stored_session_id or job.get("session_id") or run_id
+            job["session_id"] = session_id
+            job.setdefault("turn", 1)
+            if stored_session_id != session_id or json.loads(raw).get("session_id") != session_id:
+                db.execute(
+                    "UPDATE runs SET data = ?, session_id = ? WHERE id = ?",
+                    (json.dumps(job, ensure_ascii=False), session_id, run_id),
+                )
+            saved = db.execute("SELECT data FROM sessions WHERE id = ?", (session_id,)).fetchone()
+            if saved is None:
+                created = float(job.get("created", time.time()))
+                db.execute(
+                    "INSERT INTO sessions VALUES (?, ?)",
+                    (
+                        session_id,
+                        json.dumps(
+                            {
+                                "id": session_id,
+                                "title": job.get("request", "Research session")[:120],
+                                "created": created,
+                                "updated": created,
+                                "turn_count": 1,
+                                "status": job.get("status", "complete"),
+                            },
+                            ensure_ascii=False,
+                        ),
+                    ),
+                )
+        for (session_id,) in db.execute("SELECT id FROM sessions").fetchall():
+            count = db.execute(
+                "SELECT COUNT(*) FROM runs WHERE session_id = ?", (session_id,)
+            ).fetchone()[0]
+            saved = db.execute("SELECT data FROM sessions WHERE id = ?", (session_id,)).fetchone()
+            if saved:
+                session = json.loads(saved[0])
+                session["turn_count"] = count
+                db.execute(
+                    "UPDATE sessions SET data = ? WHERE id = ?",
+                    (json.dumps(session, ensure_ascii=False), session_id),
+                )
+
+    def _prune_sessions(self, db: sqlite3.Connection) -> None:
+        records = [
+            (sid, json.loads(raw))
+            for sid, raw in db.execute("SELECT id, data FROM sessions").fetchall()
+        ]
+        records.sort(
+            key=lambda row: float(row[1].get("updated", row[1].get("created", 0))), reverse=True
+        )
+        keep = {sid for sid, _ in records[: self._SESSION_LIMIT]}
+        if self.active:
+            keep.add(self.active.get("session_id", ""))
+        for session_id, _ in records:
+            if session_id not in keep:
+                db.execute("DELETE FROM runs WHERE session_id = ?", (session_id,))
+                db.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
 
     def start(self, request: WebRequest) -> dict[str, Any]:
         with self.lock:
             if self.active is not None:
                 raise RuntimeError("A research run is already in progress. Wait for it to finish.")
+            now = time.time()
+            session_id = request.session_id or uuid.uuid4().hex
+            with closing(sqlite3.connect(self.path)) as db, db:
+                row = db.execute("SELECT data FROM sessions WHERE id = ?", (session_id,)).fetchone()
+                if request.session_id and row is None:
+                    raise KeyError(session_id)
+                if row is None:
+                    session = {
+                        "id": session_id,
+                        "title": request.request[:120],
+                        "created": now,
+                        "updated": now,
+                        "turn_count": 0,
+                        "status": "running",
+                    }
+                else:
+                    session = json.loads(row[0])
+                count = db.execute(
+                    "SELECT COUNT(*) FROM runs WHERE session_id = ?", (session_id,)
+                ).fetchone()[0]
+                session.update(updated=now, turn_count=count + 1, status="running")
+                db.execute(
+                    "INSERT OR REPLACE INTO sessions VALUES (?, ?)",
+                    (session_id, json.dumps(session, ensure_ascii=False)),
+                )
+            request.session_id = session_id
             job = {
                 "id": uuid.uuid4().hex,
+                "session_id": session_id,
+                "turn": session["turn_count"],
                 "request": request.request,
+                "country": request.country,
                 "mode": request.mode,
-                "created": time.time(),
+                "created": now,
                 "status": "running",
                 "events": [],
                 "result": None,
@@ -387,7 +512,76 @@ class JobStore:
             self.active = job
             self.worker = threading.Thread(target=self._work, args=(job, request), daemon=True)
             self.worker.start()
+            self._prune_sessions_db()
             return deepcopy(job)
+
+    def _session_runs(self, session_id: str) -> list[dict]:
+        with closing(sqlite3.connect(self.path)) as db, db:
+            rows = db.execute(
+                "SELECT data FROM runs WHERE session_id = ? ORDER BY rowid", (session_id,)
+            ).fetchall()
+        runs = [json.loads(row[0]) for row in rows]
+        if self.active and self.active["session_id"] == session_id:
+            runs.append(deepcopy(self.active))
+        return runs
+
+    def session_context(self, session_id: str) -> dict[str, Any]:
+        """Compact the prior turns for follow-up interpretation without losing evidence."""
+        with closing(sqlite3.connect(self.path)) as db, db:
+            row = db.execute("SELECT data FROM sessions WHERE id = ?", (session_id,)).fetchone()
+        session = json.loads(row[0]) if row else {}
+        turns = []
+        completed_runs = [
+            job for job in self._session_runs(session_id) if job.get("status") != "running"
+        ]
+        for job in completed_runs[-self._CONTEXT_TURNS :]:
+            result = job.get("result") or {}
+            research = result.get("research") or {}
+            items = []
+            for item in (result.get("items") or [])[:20]:
+                data = item.get("data") or {}
+                items.append(
+                    {
+                        key: data[key]
+                        for key in (
+                            "title",
+                            "price",
+                            "configuration",
+                            "processor",
+                            "ram",
+                            "ram_type",
+                            "storage",
+                            "storage_type",
+                            "domain",
+                            "source_url",
+                        )
+                        if key in data
+                    }
+                )
+            turns.append(
+                {
+                    "request": job.get("request", ""),
+                    "status": job.get("status", ""),
+                    "country": research.get("country") or job.get("country", ""),
+                    "scope": research.get("scope", ""),
+                    "constraints": research.get("constraints", []),
+                    "preferences": research.get("preferences", []),
+                    "findings": items,
+                    "coverage": [
+                        {"domain": item.get("domain"), "pages_read": item.get("pages_read", 0)}
+                        for item in research.get("domains", [])
+                    ],
+                    "partial": research.get("partial", False),
+                }
+            )
+        context = {"session_title": session.get("title", ""), "turns": turns}
+        while len(json.dumps(context, ensure_ascii=False)) > self._CONTEXT_CHARS and len(turns) > 1:
+            turns.pop(0)
+        return context
+
+    def _prune_sessions_db(self) -> None:
+        with closing(sqlite3.connect(self.path)) as db, db:
+            self._prune_sessions(db)
 
     def _work(self, job: dict, request: WebRequest) -> None:
         started = time.monotonic()
@@ -398,6 +592,7 @@ class JobStore:
                 job["events"] = job["events"][-100:]
 
         try:
+            request._session_context = self.session_context(job["session_id"])
             output = self.runner(request, emit)
             with self.lock:
                 job["result"] = output
@@ -408,24 +603,31 @@ class JobStore:
                 job["error"] = (
                     str(error)
                     if isinstance(error, (ScoutError, ValueError))
-                    else (
-                        f"The run failed ({type(error).__name__}). Check your setup and try again."
-                    )
+                    else f"The run failed ({type(error).__name__}). Check your setup and try again."
                 )
         finally:
             with self.lock:
                 job["elapsed"] = round(time.monotonic() - started, 2)
                 try:
                     with closing(sqlite3.connect(self.path)) as db, db:
-                        db.execute("INSERT INTO runs VALUES (?, ?)", (job["id"], json.dumps(job)))
                         db.execute(
-                            "DELETE FROM runs WHERE rowid NOT IN "
-                            "(SELECT rowid FROM runs ORDER BY rowid DESC LIMIT 30)"
+                            "INSERT INTO runs (id, data, session_id) VALUES (?, ?, ?)",
+                            (job["id"], json.dumps(job, ensure_ascii=False), job["session_id"]),
                         )
+                        session_row = db.execute(
+                            "SELECT data FROM sessions WHERE id = ?", (job["session_id"],)
+                        ).fetchone()
+                        if session_row:
+                            session = json.loads(session_row[0])
+                            session.update(updated=time.time(), status=job["status"])
+                            db.execute(
+                                "UPDATE sessions SET data = ? WHERE id = ?",
+                                (json.dumps(session, ensure_ascii=False), job["session_id"]),
+                            )
+                        self._prune_sessions(db)
                 except sqlite3.Error:
                     job["error"] = "Result could not be saved to history; check free disk space."
                     job["status"] = "error"
-                # Retain the last job in memory too, including history write errors.
                 self.last = deepcopy(job)
                 self.active = None
 
@@ -440,27 +642,91 @@ class JobStore:
                 raise KeyError(job_id)
             return json.loads(row[0])
 
-    def history(self) -> list[dict]:
+    def get_session(self, session_id: str) -> dict[str, Any]:
+        with self.lock:
+            with closing(sqlite3.connect(self.path)) as db, db:
+                row = db.execute("SELECT data FROM sessions WHERE id = ?", (session_id,)).fetchone()
+            if row is None:
+                raise KeyError(session_id)
+            session = json.loads(row[0])
+            runs = self._session_runs(session_id)
+            if session.get("status") == "running" and not (
+                self.active and self.active.get("session_id") == session_id
+            ):
+                session["status"] = "interrupted"
+                session["turn_count"] = len(runs)
+            return {"session": session, "runs": runs}
+
+    def history(self) -> list[dict[str, Any]]:
         with self.lock, closing(sqlite3.connect(self.path)) as db, db:
-            jobs = [
-                json.loads(row[0])
-                for row in db.execute("SELECT data FROM runs ORDER BY rowid DESC LIMIT 30")
-            ]
-            if self.active:
-                jobs.insert(0, self.active)
-            return [{k: job[k] for k in ("id", "request", "created", "status")} for job in jobs]
+            sessions = [json.loads(row[0]) for row in db.execute("SELECT data FROM sessions")]
+        sessions.sort(
+            key=lambda session: float(session.get("updated", session.get("created", 0))),
+            reverse=True,
+        )
+        for session in sessions:
+            if session.get("status") == "running" and not (
+                self.active and self.active.get("session_id") == session.get("id")
+            ):
+                session["status"] = "interrupted"
+                with closing(sqlite3.connect(self.path)) as db:
+                    session["turn_count"] = db.execute(
+                        "SELECT COUNT(*) FROM runs WHERE session_id = ?", (session["id"],)
+                    ).fetchone()[0]
+        return [
+            {
+                "id": session["id"],
+                "request": session["title"],
+                "created": session["created"],
+                "updated": session.get("updated", session["created"]),
+                "status": session.get("status", "complete"),
+                "turn_count": session.get("turn_count", 0),
+            }
+            for session in sessions[: self._SESSION_LIMIT]
+        ]
 
     def delete(self, job_id: str) -> None:
-        """Delete one completed history entry; active research cannot be removed."""
+        """Delete one completed turn (legacy endpoint); active research cannot be removed."""
         with self.lock:
             if self.active and self.active["id"] == job_id:
-                raise RuntimeError("An active research session cannot be deleted.")
+                raise RuntimeError("An active research turn cannot be deleted.")
             with closing(sqlite3.connect(self.path)) as db, db:
-                cursor = db.execute("DELETE FROM runs WHERE id = ?", (job_id,))
-                if cursor.rowcount == 0:
+                row = db.execute("SELECT session_id FROM runs WHERE id = ?", (job_id,)).fetchone()
+                if row is None:
                     raise KeyError(job_id)
+                session_id = row[0]
+                db.execute("DELETE FROM runs WHERE id = ?", (job_id,))
+                count = db.execute(
+                    "SELECT COUNT(*) FROM runs WHERE session_id = ?", (session_id,)
+                ).fetchone()[0]
+                if not count:
+                    db.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+                else:
+                    row = db.execute(
+                        "SELECT data FROM sessions WHERE id = ?", (session_id,)
+                    ).fetchone()
+                    session = json.loads(row[0])
+                    session["turn_count"] = count
+                    db.execute(
+                        "UPDATE sessions SET data = ? WHERE id = ?",
+                        (json.dumps(session, ensure_ascii=False), session_id),
+                    )
             last = getattr(self, "last", None)
             if last and last["id"] == job_id:
+                del self.last
+
+    def delete_session(self, session_id: str) -> None:
+        with self.lock:
+            if self.active and self.active["session_id"] == session_id:
+                raise RuntimeError("An active research session cannot be deleted.")
+            with closing(sqlite3.connect(self.path)) as db, db:
+                row = db.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone()
+                if row is None:
+                    raise KeyError(session_id)
+                db.execute("DELETE FROM runs WHERE session_id = ?", (session_id,))
+                db.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            last = getattr(self, "last", None)
+            if last and last.get("session_id") == session_id:
                 del self.last
 
     def wait(self) -> None:

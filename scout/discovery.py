@@ -320,6 +320,7 @@ def resolve_request(
     search: Any = None,
     search_provider: str = "tinyfish",
     allow_product_research: bool = False,
+    session_context: dict[str, Any] | None = None,
 ) -> DiscoveryResult:
     """Classify one request, search if needed, and select one real result URL."""
     if not request.strip():
@@ -336,11 +337,17 @@ def resolve_request(
         if allow_product_research:
             prompt = (PROMPTS / "product_intent.md").read_text(encoding="utf-8")
         try:
+            user_content = request
+            if session_context and session_context.get("turns"):
+                user_content = json.dumps(
+                    {"current_request": request, "prior_session_context": session_context},
+                    ensure_ascii=False,
+                )
             intent_response = llm.chat(
                 "product_intent" if allow_product_research else "discover",
                 [
                     {"role": "system", "content": prompt},
-                    {"role": "user", "content": request},
+                    {"role": "user", "content": user_content},
                 ],
                 role="strong",
                 max_tokens=4096,
