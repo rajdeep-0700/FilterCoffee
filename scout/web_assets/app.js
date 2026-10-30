@@ -8,7 +8,9 @@ const state = {
   viewing: null,
   timer: null,
   toast: null,
+  countryNames: new Map(),
 };
+let preferredCountry = "";
 const names = {
   web: "Web",
   github: "GitHub",
@@ -50,12 +52,14 @@ function notify(text) {
     $("toast").hidden = true;
   }, 4500);
 }
-async function api(path, payload) {
+async function api(path, payload, method) {
   const options = { headers: { "X-Scout-Token": token }, cache: "no-store" };
   if (payload !== undefined) {
-    options.method = "POST";
+    options.method = method || "POST";
     options.headers["Content-Type"] = "application/json";
     options.body = JSON.stringify(payload);
+  } else if (method) {
+    options.method = method;
   }
   let response;
   try {
@@ -65,7 +69,7 @@ async function api(path, payload) {
       "FilterCoffee is disconnected. Keep the launcher window open, or reopen the app.",
     );
   }
-  const value = await response.json();
+  const value = response.status === 204 ? null : await response.json();
   if (!response.ok) throw new Error(value.error || "The request failed.");
   return value;
 }
@@ -287,16 +291,93 @@ function renderJob(job) {
   const fields = result.plan?.fields || [];
   if (result.research) {
     const coverage = result.research;
-    $("footer-status").textContent = coverage.partial ? "Partial comparison" : "Comparison complete";
+    $("footer-status").textContent = coverage.partial
+      ? "Partial comparison"
+      : "Comparison complete";
     const note = node("section", null, "notice");
-    note.append(node("strong", coverage.partial ? "Partial research results" : "Product comparison"));
-    note.append(node("p", `${coverage.searches + coverage.fetches} / ${coverage.limit} search/page requests · ${coverage.domains.length} websites · ${coverage.country || "Market unspecified"}`));
+    note.append(
+      node(
+        "strong",
+        coverage.partial ? "Partial research results" : "Product comparison",
+      ),
+    );
+    note.append(
+      node(
+        "p",
+        `${coverage.searches + coverage.fetches} / ${coverage.limit} search/page requests · ${coverage.domains.length} websites · ${state.countryNames.get(coverage.country) || coverage.country || "Market unspecified"}`,
+      ),
+    );
     if (coverage.partial) note.append(node("p", coverage.stop_reason));
-    note.append(node("p", "Ranked by overall fit to your requirements. Coverage is limited to the pages checked; prices and availability can change."));
+    if (coverage.constraints && coverage.constraints.length) {
+      const operators = {
+        min: "at least",
+        max: "at most",
+        equals: "exactly",
+        contains: "includes",
+      };
+      const required = coverage.constraints
+        .map(
+          (item) =>
+            item.field.replaceAll("_", " ") +
+            " " +
+            (operators[item.operator] || item.operator) +
+            " " +
+            item.value +
+            (item.unit ? " " + item.unit : ""),
+        )
+        .join(" · ");
+      note.append(node("p", "Required: " + required));
+    }
+    note.append(
+      node(
+        "p",
+        "Ranked by overall fit to your requirements. Coverage is limited to the pages checked; prices and availability can change.",
+      ),
+    );
+    const searchDetails = node("details");
+    const queries = coverage.search_queries || [];
+    searchDetails.append(
+      node("summary", "Search queries used (" + queries.length + ")"),
+    );
+    queries.forEach((entry) =>
+      searchDetails.append(
+        node("p", (entry.domain || "Open web") + ": " + entry.query),
+      ),
+    );
+    note.append(searchDetails);
     const detail = node("details");
     detail.append(node("summary", "Websites checked and excluded matches"));
-    coverage.domains.forEach((domain) => detail.append(node("p", `${domain.domain}: ${domain.searches} searches · ${domain.pages_read} pages read`)));
-    coverage.excluded.forEach((entry) => detail.append(node("p", entry.reasons.join("; "))));
+    coverage.domains.forEach((domain) =>
+      detail.append(
+        node(
+          "p",
+          `${domain.domain}: ${domain.searches} searches · ${domain.pages_read} pages read`,
+        ),
+      ),
+    );
+    coverage.excluded.forEach((entry) => {
+      const row = node("p");
+      row.append(node("strong", entry.title || "Unmatched listing"));
+      if (entry.url) {
+        row.append(
+          document.createTextNode(" · "),
+          safeLink(entry.url, "Source"),
+        );
+      }
+      row.append(document.createTextNode(" — " + entry.reasons.join("; ")));
+      const observed = Object.entries(entry.observed || {}).map(
+        ([field, fact]) =>
+          field.replaceAll("_", " ") +
+          ": " +
+          fact.value +
+          (fact.unit ? " " + fact.unit : ""),
+      );
+      if (observed.length)
+        row.append(
+          document.createTextNode(" · Observed: " + observed.join(", ")),
+        );
+      detail.append(row);
+    });
     note.append(detail);
     $("response").append(note);
   }
@@ -323,7 +404,9 @@ function renderJob(job) {
       "p",
       items.length
         ? "The extracted values are below. Expand longer text and supporting quotes without making another model call."
-        : "No verified rows were returned. Review the source and warnings below, or try a more specific request.",
+        : result.research
+          ? "No products passed evidence and requirement checks on the pages read. Expand Websites checked and excluded matches below to see what was rejected and why."
+          : "No verified rows were returned. Review the source and warnings below, or try a more specific request.",
       "summary",
     ),
   );
@@ -358,7 +441,8 @@ function renderJob(job) {
     details.append(
       node("summary", `Supporting evidence (${item.evidence?.length || 0})`),
     );
-    if (result.research && item.data?.source_url) details.append(safeLink(item.data.source_url, "Read this listing"));
+    if (result.research && item.data?.source_url)
+      details.append(safeLink(item.data.source_url, "Read this listing"));
     (item.evidence || []).forEach((entry) =>
       details.append(
         node("strong", label(entry.field)),
@@ -487,7 +571,8 @@ function renderEvidence(items) {
   );
   items.forEach((item, index) => {
     const details = node("details");
-    if (state.job?.result?.research && item.data?.source_url) details.append(safeLink(item.data.source_url, "Read this listing"));
+    if (state.job?.result?.research && item.data?.source_url)
+      details.append(safeLink(item.data.source_url, "Read this listing"));
     details.append(
       node(
         "summary",
@@ -512,6 +597,7 @@ async function loadHistory() {
   if (!jobs.length)
     $("history").append(node("p", "Your research will appear here.", "subtle"));
   jobs.forEach((job) => {
+    const row = node("div", null, "history-entry");
     const button = node(
       "button",
       null,
@@ -521,14 +607,14 @@ async function loadHistory() {
     text.append(
       node(
         "time",
-        `${new Date(job.created * 1000).toLocaleDateString()} · ${job.status}`,
+        new Date(job.created * 1000).toLocaleDateString() + " · " + job.status,
       ),
     );
     button.append(icon("chat"), text);
     button.title = job.request;
     button.addEventListener("click", async () => {
       try {
-        const saved = await api(`/api/runs/${job.id}`);
+        const saved = await api("/api/runs/" + job.id);
         clearResult();
         showView("response");
         renderJob(saved);
@@ -537,7 +623,45 @@ async function loadHistory() {
         notify(error.message);
       }
     });
-    $("history").append(button);
+    const remove = node("button", null, "delete-session");
+    remove.append(icon("trash"));
+    remove.setAttribute("aria-label", "Delete session");
+    remove.title =
+      job.status === "running"
+        ? "Wait for this run to finish before deleting it."
+        : "Delete saved session";
+    remove.disabled = job.status === "running";
+    remove.addEventListener("click", async () => {
+      if (
+        !window.confirm(
+          "Delete this saved session and its result from history?",
+        )
+      )
+        return;
+      remove.disabled = true;
+      try {
+        await api("/api/runs/" + job.id, undefined, "DELETE");
+        if (state.viewing === job.id) {
+          state.job = null;
+          state.viewing = null;
+          clearResult();
+          $("welcome").hidden = false;
+          $("run-heading").hidden = true;
+          $("run-status").hidden = true;
+          $("activity").replaceChildren(
+            node("li", "Steps for your next run will appear here.", "muted"),
+          );
+          $("footer-status").textContent = "Ready when you are";
+          showView("response");
+        }
+        await loadHistory();
+      } catch (error) {
+        remove.disabled = false;
+        notify(error.message);
+      }
+    });
+    row.append(button, remove);
+    $("history").append(row);
   });
   return jobs;
 }
@@ -624,10 +748,13 @@ function markdown() {
   const lines = [`# ${state.job.request}`, "", `Source: ${result.url}`, ""];
   if (result.research) {
     const r = result.research;
-    lines.push(`Status: ${r.partial ? "Partial comparison" : "Comparison complete"}`,
+    lines.push(
+      `Status: ${r.partial ? "Partial comparison" : "Comparison complete"}`,
       `Country / market: ${r.country || "Unspecified"}`,
       `Search/page requests: ${r.searches + r.fetches} / ${r.limit}`,
-      `Coverage: ${r.domains.length} websites. ${r.stop_reason}`, "");
+      `Coverage: ${r.domains.length} websites. ${r.stop_reason}`,
+      "",
+    );
   }
   (result.items || []).forEach((item, index) => {
     lines.push(`## Result ${index + 1}`, "");
@@ -654,7 +781,9 @@ function download(text, type, extension) {
 function csv() {
   const result = state.job.result;
   const fields = result.plan.fields.map((f) => f.name);
-  const extraFields = result.research ? ["research_partial", "research_stop_reason"] : [];
+  const extraFields = result.research
+    ? ["research_partial", "research_stop_reason"]
+    : [];
   const escape = (value) => {
     let text = value === null || value === undefined ? "" : display(value);
     // Keep untrusted spreadsheet text from becoming executable formulas.
@@ -663,10 +792,15 @@ function csv() {
   };
   return (
     "\ufeff" +
-    [[...fields, ...extraFields], ...result.items.map((item) => [
-      ...fields.map((f) => item.data[f]),
-      ...(result.research ? [result.research.partial, result.research.stop_reason] : []),
-    ])]
+    [
+      [...fields, ...extraFields],
+      ...result.items.map((item) => [
+        ...fields.map((f) => item.data[f]),
+        ...(result.research
+          ? [result.research.partial, result.research.stop_reason]
+          : []),
+      ]),
+    ]
       .map((row) => row.map(escape).join(","))
       .join("\r\n")
   );
@@ -800,7 +934,8 @@ async function boot() {
       localStorage.getItem("scout-preferences") || "null",
     );
     if (prefs) {
-      if (typeof prefs.country === "string") $("country").value = prefs.country.slice(0, 80);
+      if (typeof prefs.country === "string")
+        preferredCountry = prefs.country.slice(0, 80);
       if (["auto", "sources", "url", "manual"].includes(prefs.mode))
         $("mode").value = prefs.mode;
       if (["auto", "off", "chromium", "cloak"].includes(prefs.browser))
@@ -817,9 +952,26 @@ async function boot() {
   } catch {
     setTheme("dark");
   }
-  scopeChanged();
   try {
     const config = await api("/api/config");
+    state.countryNames = new Map(
+      (config.countries || []).map((item) => [item.code, item.name]),
+    );
+    const country = $("country");
+    country.replaceChildren(node("option", "Any country"));
+    country.options[0].value = "";
+    (config.countries || []).forEach((entry) => {
+      const option = node("option", entry.name);
+      option.value = entry.code;
+      country.append(option);
+    });
+    const savedCountry = (config.countries || []).find(
+      (entry) =>
+        entry.code === preferredCountry.toUpperCase() ||
+        entry.name.toLowerCase() === preferredCountry.toLowerCase(),
+    );
+    country.value = savedCountry?.code || "";
+    scopeChanged();
     $("connection").replaceChildren(
       node("i", null, "dot"),
       node("span", "Local connection"),

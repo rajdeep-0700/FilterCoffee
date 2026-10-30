@@ -347,6 +347,11 @@ def resolve_request(
             )
             intent = RequestIntent.model_validate(parse_json(intent_response.text))
         except (ScoutError, ValidationError, ValueError) as error:
+            if allow_product_research:
+                raise DiscoveryError(
+                    "Could not understand the product request. Restate the product, required "
+                    "specs, budget, and country if relevant."
+                ) from None
             raise DiscoveryError(f"Could not understand that request: {error}") from None
 
         if allow_product_research and intent.product_research is not None:

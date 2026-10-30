@@ -21,6 +21,9 @@
           <circle cx="10.5" cy="10.5" r="6.5" />
           <path d="m16 16 5 5" />
         </symbol>
+        <symbol id="i-trash" viewBox="0 0 24 24">
+          <path d="M3 6h18M8 6V4h8v2m3 0-1 15H6L5 6m4 4v7m6-7v7" />
+        </symbol>
         <symbol id="i-plus" viewBox="0 0 24 24">
           <path d="M12 5v14M5 12h14" />
         </symbol>
@@ -113,8 +116,13 @@
             <option value="manual">Import saved page</option>
           </select>
           <label class="field-label" for="country">Country / market</label>
-          <input id="country" type="text" maxlength="80" placeholder="Optional · e.g. India" autocomplete="country-name" />
-          <p class="subtle">Product comparisons: up to 15 sites and 200 search/page requests. Requests and page text are sent to Gemini and TinyFish.</p>
+          <select id="country">
+            <option value="">Any country</option>
+          </select>
+          <p class="subtle">
+            Product comparisons: up to 15 sites and 200 search/page requests.
+            Requests and page text are sent to Gemini and TinyFish.
+          </p>
           <p class="subtle" id="scope-help">
             FilterCoffee finds one relevant page or video. Mention YouTube in
             your request to search for a video.
@@ -313,6 +321,18 @@
                     >Book titles and prices from a public page</small
                   ></span
                 ><svg aria-hidden="true"><use href="#i-arrow" /></svg>
+              </button>
+              <button
+                data-example="Compare laptops in India with a budget under ₹80,000, at least 16 GB RAM, and 512 GB SSD. Search relevant retailers, inspect multiple listings per site, and compare the best matching options with price, exact configuration, and source links."
+              >
+                <svg aria-hidden="true"><use href="#i-table" /></svg>
+                <span
+                  >Compare laptops across sites<small
+                    >Search up to 15 relevant websites · check specs and budget
+                    across listings</small
+                  ></span
+                >
+                <svg aria-hidden="true"><use href="#i-arrow" /></svg>
               </button>
             </div>
             <p class="privacy-note">

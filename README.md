@@ -47,8 +47,11 @@ the startup resolver checks them against the selected provider.
 #### Product comparisons
 
 In Auto mode, describe what you want to buy, your hard requirements and budget,
-and any preferences. The optional **Country / market** field guides retailer searches;
-it overrides a country in the request. No location is inferred from your computer.
+and any preferences. The optional **Country / market** field geo-targets TinyFish Search
+(using its ISO country code) and guides retailer queries; it overrides a country in the
+request. No location is inferred from your computer. Product coverage reports the interpreted
+hard requirements, per-domain searches/pages, and excluded listings with observed values
+and reasons, so an empty result can be distinguished from incomplete search coverage.
 Ordinary factual lookups and page/video extraction keep the single-page flow.
 
 Product research uses one Nemotron request to interpret the task, Gemini to guide

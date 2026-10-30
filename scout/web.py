@@ -153,6 +153,34 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             self._json(500, {"error": "Could not start the run. Check your local configuration."})
 
+    def do_DELETE(self) -> None:
+        if not self._allowed(api=True):
+            return
+        path = urlsplit(self.path).path
+        if not path.startswith("/api/runs/"):
+            self._json(404, {"error": "Not found."})
+            return
+        job_id = path.rsplit("/", 1)[-1]
+        if not job_id or "/" in job_id:
+            self._json(404, {"error": "Not found."})
+            return
+        try:
+            self.app.store.delete(job_id)
+        except KeyError:
+            self._json(404, {"error": "That saved session no longer exists."})
+            return
+        except RuntimeError as error:
+            self._json(409, {"error": str(error)})
+            return
+        except Exception:
+            self._json(500, {"error": "Could not delete that saved session."})
+            return
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)

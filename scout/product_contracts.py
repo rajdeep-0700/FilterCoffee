@@ -3,7 +3,7 @@
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from scout.contracts import ExtractedItem, ExtractionPlan, FieldSpec, RunMeta
 
@@ -18,6 +18,11 @@ class Constraint(StrictModel):
     value: str = Field(min_length=1, max_length=200)
     unit: str = Field(default="", max_length=30)
 
+    @field_validator("unit", mode="before")
+    @classmethod
+    def empty_null_unit(cls, value: object) -> object:
+        return "" if value is None else value
+
 
 class ProductPlan(StrictModel):
     scope: Literal["web", "site", "url"]
@@ -27,6 +32,11 @@ class ProductPlan(StrictModel):
     country: str = Field(default="", max_length=80)
     constraints: list[Constraint] = Field(default_factory=list, max_length=20)
     preferences: list[str] = Field(default_factory=list, max_length=12)
+
+    @field_validator("site", "url", "country", mode="before")
+    @classmethod
+    def empty_null_scope_fields(cls, value: object) -> object:
+        return "" if value is None else value
 
     @model_validator(mode="after")
     def check_scope(self) -> "ProductPlan":

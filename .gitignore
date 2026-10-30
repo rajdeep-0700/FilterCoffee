@@ -16,3 +16,7 @@ data/
 .ruff_cache/
 .serena/
 tests/
+!tests/
+tests/*
+!tests/test_web_ui.py
+!tests/test_product_research.py

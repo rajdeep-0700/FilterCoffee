@@ -78,8 +78,19 @@ class TinyFishClient:
             raise error_type("TinyFish returned an invalid response.")
         return value
 
-    def search(self, query: str, *, include_domains: list[str] | None = None) -> list[SearchResult]:
+    def search(
+        self,
+        query: str,
+        *,
+        include_domains: list[str] | None = None,
+        location: str | None = None,
+    ) -> list[SearchResult]:
         params = {"query": query}
+        if location is not None:
+            location = location.strip().upper()
+            if len(location) != 2 or not location.isascii() or not location.isalpha():
+                raise DiscoveryError("TinyFish search location must be a two-letter country code.")
+            params["location"] = location
         if include_domains:
             params["include_domains"] = ",".join(include_domains)
         data = self._request("search", params=params)

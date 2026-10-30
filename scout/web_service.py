@@ -24,6 +24,7 @@ from scout.browser import BrowserRenderer, CloakBrowserRenderer
 from scout.cache import Cache, digest
 from scout.config import load_environment, load_settings
 from scout.contracts import ExtractResult
+from scout.countries import country_name, country_options
 from scout.discovery import resolve_request
 from scout.errors import ConfigurationError, ScoutError
 from scout.fetch import Fetcher
@@ -136,6 +137,7 @@ def capabilities() -> dict[str, Any]:
         "web_provider": "TinyFish" if os.getenv("TINYFISH_API_KEY") else "Tavily",
         "cloak": find_spec("cloakbrowser") is not None,
         "opencli": {"available": status.available, "reason": status.reason, "site": source.site},
+        "countries": country_options(),
     }
 
 
@@ -275,7 +277,7 @@ def execute_request(
                 if discovery.product_research is not None:
                     product_plan = discovery.product_research.model_copy(deep=True)
                     if request.country:
-                        product_plan.country = request.country
+                        product_plan.country = country_name(request.country)
                     if request.mode == "url":
                         product_plan.scope, product_plan.url = "url", request.url
                     tiny = TinyFishClient(os.getenv("TINYFISH_API_KEY", ""), cache=cache)
@@ -447,6 +449,19 @@ class JobStore:
             if self.active:
                 jobs.insert(0, self.active)
             return [{k: job[k] for k in ("id", "request", "created", "status")} for job in jobs]
+
+    def delete(self, job_id: str) -> None:
+        """Delete one completed history entry; active research cannot be removed."""
+        with self.lock:
+            if self.active and self.active["id"] == job_id:
+                raise RuntimeError("An active research session cannot be deleted.")
+            with closing(sqlite3.connect(self.path)) as db, db:
+                cursor = db.execute("DELETE FROM runs WHERE id = ?", (job_id,))
+                if cursor.rowcount == 0:
+                    raise KeyError(job_id)
+            last = getattr(self, "last", None)
+            if last and last["id"] == job_id:
+                del self.last
 
     def wait(self) -> None:
         if self.worker:

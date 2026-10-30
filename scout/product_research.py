@@ -10,7 +10,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from tldextract import TLDExtract
 
@@ -22,6 +22,7 @@ from scout.contracts import (
     ModelCall,
     RunMeta,
 )
+from scout.countries import country_code as country_location
 from scout.errors import ScoutError, SecurityError
 from scout.llm import LLMClient, parse_json
 from scout.product_contracts import (
@@ -91,17 +92,118 @@ def _number(value: str) -> Decimal | None:
         return None
 
 
+_CURRENCY_ALIASES = {
+    "INR": {"inr", "₹", "rs", "rs.", "rupee", "rupees"},
+    "USD": {"usd", "us$", "us dollars"},
+    "CAD": {"cad", "c$", "ca$", "canadian dollars"},
+    "AUD": {"aud", "a$", "au$", "australian dollars"},
+    "NZD": {"nzd", "nz$"},
+    "GBP": {"gbp", "£", "pound", "pounds"},
+    "EUR": {"eur", "€", "euro", "euros"},
+    "JPY": {"jpy", "¥", "yen"},
+    "CNY": {"cny", "rmb", "元", "yuan"},
+    "AED": {"aed", "د.إ"},
+}
+_COUNTRY_CURRENCY = {
+    "india": "INR",
+    "in": "INR",
+    "united states": "USD",
+    "us": "USD",
+    "usa": "USD",
+    "canada": "CAD",
+    "ca": "CAD",
+    "australia": "AUD",
+    "au": "AUD",
+    "new zealand": "NZD",
+    "nz": "NZD",
+    "united kingdom": "GBP",
+    "uk": "GBP",
+    "gb": "GBP",
+    "ireland": "EUR",
+    "eurozone": "EUR",
+    "japan": "JPY",
+    "jp": "JPY",
+    "china": "CNY",
+    "cn": "CNY",
+    "united arab emirates": "AED",
+    "uae": "AED",
+}
+
+
+def _unit_key(unit: str, country: str) -> str:
+    normalized = unit.strip().casefold()
+    if normalized in {"$", "dollar", "dollars"}:
+        return _COUNTRY_CURRENCY.get(country.strip().casefold(), "ambiguous-dollar")
+    for code, aliases in _CURRENCY_ALIASES.items():
+        if normalized in {alias.casefold() for alias in aliases}:
+            if normalized in {"$", "dollar", "dollars"}:
+                return _COUNTRY_CURRENCY.get(country.strip().casefold(), "ambiguous-dollar")
+            return code
+    return re.sub(r"\s+", "", normalized)
+
+
+def _unit_in_quote(unit: str, quote: str, country: str) -> bool:
+    normalized = unit.strip().casefold()
+    code = _unit_key(unit, country)
+    aliases = _CURRENCY_ALIASES.get(code, {normalized})
+    if code == "ambiguous-dollar":
+        aliases = {"$"}
+    if _COUNTRY_CURRENCY.get(country.strip().casefold()) == code and "$" in quote:
+        return True
+    for alias in aliases:
+        alias = alias.casefold()
+        if alias in {"₹", "£", "€", "¥", "元", "د.إ", "$", "c$", "ca$", "a$", "au$", "nz$", "us$"}:
+            if alias in quote:
+                return True
+        elif re.search(r"(?<![a-z])" + re.escape(alias) + r"(?![a-z])", quote):
+            return True
+    return False
+
+
+def _value_supported(field: str, value: str, quote: str) -> bool:
+    normalized = normalize_text(value).casefold()
+    if normalized and normalized in quote:
+        return True
+    if field != "price":
+        return False
+    expected = _number(value)
+    if expected is None:
+        return False
+    return any(
+        (actual := _number(token)) is not None and actual == expected
+        for token in re.findall(r"\d[\d,]*(?:\.\d+)?", quote)
+    )
+
+
+def _page_type(url: str, title: str) -> str:
+    """Distinguish common retailer search/listing pages from individual product pages."""
+    parsed = urlsplit(url)
+    path_parts = [part.casefold() for part in parsed.path.split("/") if part]
+    query_keys = {key.casefold() for key, _ in parse_qsl(parsed.query, keep_blank_values=True)}
+    search_paths = {"s", "search", "search-results", "searchresults", "results"}
+    if (
+        path_parts
+        and path_parts[-1] in search_paths
+        and query_keys & {"q", "k", "query", "keywords", "search_query"}
+    ):
+        return "search_results"
+    if re.search(r"\b(search results|results for|search results for)\b", title, re.I):
+        return "search_results"
+    return "product"
+
+
 def qualifying(candidate: ProductCandidate, plan: ProductPlan, text: str) -> list[str]:
-    """Verify exact quotations and hard constraints before accepting a model's score."""
+    """Verify page quotes and hard requirements without rejecting currency formats."""
     failures = []
     normalized = normalize_text(text).casefold()
+    country = plan.country
     for name, fact in candidate.facts.items():
-        quote, value = normalize_text(fact.quote).casefold(), normalize_text(fact.value).casefold()
-        if quote not in normalized or value not in quote:
+        quote = normalize_text(fact.quote).casefold()
+        if quote not in normalized or not _value_supported(name, fact.value, quote):
             failures.append(f"{name}: unsupported evidence")
-        if fact.unit and fact.unit.casefold() not in quote:
+        if fact.unit and not _unit_in_quote(fact.unit, quote, country):
             failures.append(f"{name}: unsupported unit/currency")
-    for required in ("title", "price", "configuration"):
+    for required in ("title", "price"):
         if required not in candidate.facts:
             failures.append(f"{required}: unknown")
     for constraint in plan.constraints:
@@ -109,11 +211,16 @@ def qualifying(candidate: ProductCandidate, plan: ProductPlan, text: str) -> lis
         if not fact:
             failures.append(f"{constraint.field}: unknown hard requirement")
             continue
-        unit_ok = not constraint.unit or constraint.unit.casefold() == fact.unit.casefold()
+        quote = normalize_text(fact.quote).casefold()
+        observed_unit = fact.unit or constraint.unit
+        unit_ok = not constraint.unit or (
+            _unit_key(constraint.unit, country) == _unit_key(observed_unit, country)
+            and _unit_in_quote(constraint.unit, quote, country)
+        )
         actual, expected = _number(fact.value), _number(constraint.value)
         if constraint.operator in {"min", "max"}:
             passed = unit_ok and actual is not None and expected is not None
-            if actual is not None and expected is not None and unit_ok:
+            if passed and actual is not None and expected is not None:
                 passed = actual >= expected if constraint.operator == "min" else actual <= expected
         else:
             left, right = fact.value.casefold(), constraint.value.casefold()
@@ -121,7 +228,34 @@ def qualifying(candidate: ProductCandidate, plan: ProductPlan, text: str) -> lis
                 left == right if constraint.operator == "equals" else right in left
             )
         if not passed:
-            failures.append(f"{constraint.field}: hard requirement not met or not comparable")
+            if not unit_ok:
+                reason = (
+                    f"{constraint.field}: cannot compare {fact.unit or 'unverified unit'} "
+                    f"with required {constraint.unit or 'unitless value'}"
+                )
+            elif (
+                actual is not None
+                and expected is not None
+                and constraint.operator == "max"
+                and actual > expected
+            ):
+                reason = (
+                    f"{constraint.field}: {fact.value} {fact.unit} exceeds maximum "
+                    f"{constraint.value} {constraint.unit}"
+                )
+            elif (
+                actual is not None
+                and expected is not None
+                and constraint.operator == "min"
+                and actual < expected
+            ):
+                reason = (
+                    f"{constraint.field}: {fact.value} {fact.unit} is below minimum "
+                    f"{constraint.value} {constraint.unit}"
+                )
+            else:
+                reason = f"{constraint.field}: hard requirement not met or not comparable"
+            failures.append(reason)
     return failures
 
 
@@ -154,6 +288,7 @@ class ProductResearch:
         self.pages: dict[str, dict] = {}
         self.attempted: set[str] = set()
         self.queries: set[tuple[str, str]] = set()
+        self.search_log: list[dict[str, str]] = []
         self.candidates: dict[str, dict] = {}
         self.excluded: list[dict] = []
         self.warnings: list[str] = []
@@ -165,6 +300,11 @@ class ProductResearch:
         self.stop_reason = "completed"
         self.partial = False
         self.scope_domain = domain_key(plan.url) if plan.scope == "url" else ""
+        self.location = country_location(plan.country)
+        if plan.country and not self.location:
+            self.warnings.append(
+                "Country was not recognized for geo-targeted search; query terms still include it."
+            )
         self.last_results: list[dict] = []
 
     def _check_time(self) -> None:
@@ -180,6 +320,7 @@ class ProductResearch:
                 raise ValueError("15-domain limit reached.")
             self.domains[domain] = {
                 "domain": domain,
+                "queries": [],
                 "searches": 0,
                 "fetches": 0,
                 "pages_read": 0,
@@ -187,30 +328,60 @@ class ProductResearch:
             }
         return self.domains[domain]
 
+    def _remember_candidate(self, url: str, details: dict) -> bool:
+        if url in self.known:
+            return True
+        domain = details["domain"]
+        domain_count = sum(item["domain"] == domain for item in self.known.values())
+        if len(self.known) >= 300 or domain_count >= 30:
+            return False
+        self.known[url] = details
+        return True
+
     def search(self, query: str, domain: str = "") -> dict:
         self._check_time()
         query = query.strip()
         if not query:
             raise ValueError("Search query is empty.")
-        # Model-supplied site: operators must not override the backend scope.
+        # Model-supplied site: operators must not override backend scope.
         query = re.sub(r"\bsite:\S+", "", query, flags=re.I).strip()
+        requested_domain = ""
         if domain:
             if "://" in domain or "/" in domain or " " in domain:
                 raise ValueError("Expected a domain, not a URL.")
-            domain = domain_key("https://" + domain)
-            if not any(domain_key(url) == domain for url in self.known):
-                raise ValueError("Discover the website in search results before targeting it.")
+            requested_domain = domain_key("https://" + domain)
+            discovered = any(domain_key(url) == requested_domain for url in self.known)
+            if discovered:
+                domain = requested_domain
+                requested_domain = ""
+            elif self.scope_domain:
+                raise SecurityError("Search target is outside the selected website.")
+            else:
+                # Never issue a domain-scoped request for an unobserved model-supplied host.
+                # Search globally for it instead, then only target domains returned by search.
+                target = requested_domain
+                report = self.domains.get(target)
+                if report and report["searches"] >= 2:
+                    raise ValueError("Two targeted searches per domain reached.")
+                if self.discovery_searches >= 20:
+                    raise ValueError("20 discovery searches reached.")
+                self.warnings.append(
+                    f"{target} was not discovered; searching broadly to verify it."
+                )
+                query = f"{query} {target}".strip()
+                requested_domain = target
+                domain = ""
+        if domain:
             report = self._admit(domain)
             if report["searches"] >= 2:
                 raise ValueError("Two targeted searches per domain reached.")
-        else:
-            if self.scope_domain:
-                domain = self.scope_domain
-                report = self._admit(domain)
-                if report["searches"] >= 2:
-                    raise ValueError("Two targeted searches per domain reached.")
-            elif self.discovery_searches >= 20:
-                raise ValueError("20 discovery searches reached.")
+        elif self.scope_domain:
+            domain = self.scope_domain
+            report = self._admit(domain)
+            if report["searches"] >= 2:
+                raise ValueError("Two targeted searches per domain reached.")
+        elif self.discovery_searches >= 20:
+            raise ValueError("20 discovery searches reached.")
         key = (domain, query.casefold())
         if key in self.queries:
             raise ValueError("Repeated search skipped.")
@@ -222,9 +393,16 @@ class ProductResearch:
             self.discovery_searches += 1
         country = f" {self.plan.country}" if self.plan.country else ""
         site = f"site:{domain} " if domain else ""
+        submitted_query = site + query + country
+        entry = {"domain": domain, "query": submitted_query, "location": self.location or ""}
+        self.search_log.append(entry)
+        if domain:
+            self.domains[domain]["queries"].append(submitted_query)
         self.emit("Searching products", domain or "Discovering relevant websites")
         found = self.tinyfish.search(
-            site + query + country, include_domains=[domain] if domain else None
+            submitted_query,
+            include_domains=[domain] if domain else None,
+            location=self.location,
         )
         rows = []
         for hit in found:
@@ -236,13 +414,20 @@ class ProductResearch:
                 validate_url(url, resolver=self.resolver)
             except (ScoutError, ValueError):
                 continue
-            self.known[url] = {
+            details = {
                 "url": url,
                 "domain": host,
                 "title": hit.title,
                 "snippet": hit.description,
+                "discovered_from": "search",
             }
-            rows.append(self.known[url])
+            if self._remember_candidate(url, details):
+                rows.append(self.known[url])
+        # A broad search requested for an unverified target still counts as a site-search
+        # slot only if its actual results prove that the site is relevant.
+        if requested_domain and any(row["domain"] == requested_domain for row in rows):
+            report = self._admit(requested_domain)
+            report["searches"] += 1
         return {"operation": "search", "results": rows}
 
     def fetch(self, url: str) -> dict:
@@ -258,8 +443,8 @@ class ProductResearch:
             raise ValueError("Ten fetched listing pages per domain reached.")
         validate_url(url, resolver=self.resolver)
         self.robots_check(url)
-        self.attempted.add(url)
         self.budget.reserve("fetch")
+        self.attempted.add(url)
         report["fetches"] += 1
         self.emit("Reading product page", url)
         fetched = self.tinyfish.fetch(url, force_refresh=True)
@@ -275,6 +460,30 @@ class ProductResearch:
         if cleaned.blocked or not cleaned.source_text:
             raise ValueError("Page is empty or blocked; no alternate fetch attempted.")
         page_id = f"p{len(self.pages) + 1}"
+        page_type = _page_type(final, cleaned.title or "")
+        links = []
+        for anchor in cleaned.tree.css("a[href]"):
+            if len(links) >= 20:
+                break
+            href = anchor.attributes.get("href") or ""
+            label = normalize_text(anchor.text(separator=" "))
+            try:
+                candidate_url = canonical_url(urljoin(final, href))
+                if candidate_url == final or domain_key(candidate_url) != domain:
+                    continue
+                validate_url(candidate_url, resolver=self.resolver)
+            except (ScoutError, ValueError):
+                continue
+            details = {
+                "url": candidate_url,
+                "domain": domain,
+                "title": label[:300] or candidate_url,
+                "snippet": "Linked from " + (cleaned.title or final),
+                "discovered_from": "page_link",
+                "parent_url": final,
+            }
+            if self._remember_candidate(candidate_url, details):
+                links.append(self.known[candidate_url])
         # Store only the bounded text actually shown to Gemini for quote verification.
         page = {
             "page_id": page_id,
@@ -283,6 +492,8 @@ class ProductResearch:
             "domain": domain,
             "checked_at": datetime.now(UTC).isoformat(),
             "title": cleaned.title,
+            "page_type": page_type,
+            "links": links,
             "text": cleaned.source_text[:16000],
         }
         self.pages[page_id] = page
@@ -292,7 +503,25 @@ class ProductResearch:
     def accept(self, candidate: ProductCandidate) -> None:
         page = self.pages.get(candidate.page_id)
         if not page:
-            self.excluded.append({"id": candidate.id, "reasons": ["Page was not fetched"]})
+            title = candidate.facts.get("title")
+            self.excluded.append(
+                {
+                    "id": candidate.id,
+                    "title": title.value if title else "Unidentified listing",
+                    "reasons": ["Page was not fetched"],
+                }
+            )
+            return
+        title = candidate.facts.get("title")
+        if page.get("page_type") == "search_results":
+            self.excluded.append(
+                {
+                    "id": candidate.id,
+                    "title": title.value if title else "Search results page",
+                    "url": page["url"],
+                    "reasons": ["Search results page, not an individual product listing."],
+                }
+            )
             return
         failures = qualifying(candidate, self.plan, page["text"])
         all_fields = set(candidate.facts)
@@ -301,7 +530,22 @@ class ProductResearch:
         if len(all_fields) > 30:
             failures.append("Comparison field limit reached; use consistent requested fields.")
         if failures:
-            self.excluded.append({"id": candidate.id, "url": page["url"], "reasons": failures})
+            title = candidate.facts.get("title")
+            observed_fields = {constraint.field for constraint in self.plan.constraints}
+            observed = {
+                name: {"value": fact.value, "unit": fact.unit}
+                for name, fact in candidate.facts.items()
+                if name in observed_fields
+            }
+            self.excluded.append(
+                {
+                    "id": candidate.id,
+                    "title": title.value if title else "Unidentified listing",
+                    "url": page["url"],
+                    "observed": observed,
+                    "reasons": failures,
+                }
+            )
             return
         # One configuration per fetched listing; no combining prices from unrelated variants.
         key = page["final_url"]
@@ -318,6 +562,7 @@ class ProductResearch:
             "scope_domain": self.scope_domain,
             "usage": {"searches": self.budget.searches, "fetches": self.budget.fetches},
             "domains": list(self.domains.values()),
+            "discovered_candidates": list(self.known.values()),
             "observations": self.last_results,
             "pages": [
                 {k: v for k, v in page.items() if k != "text"} for page in self.pages.values()
@@ -357,10 +602,9 @@ class ProductResearch:
                 turn = self._turn()
                 for candidate in turn.candidates:
                     self.accept(candidate)
-                if turn.done:
-                    break
                 before = (len(self.known), len(self.pages), len(self.candidates))
                 self.last_results = []
+                action_failed = False
                 for action in turn.actions:
                     try:
                         if action.operation == "search":
@@ -386,9 +630,13 @@ class ProductResearch:
                             result = self.fetch(action.url)
                         self.last_results.append(result)
                     except (ScoutError, ValueError) as error:
+                        action_failed = True
                         message = str(error)
                         self.last_results.append({"error": message})
                         self.warnings.append(message)
+                        self.partial = True
+                        if self.stop_reason == "completed":
+                            self.stop_reason = "Some searches or pages could not be checked."
                         if self.budget.searches + self.budget.fetches >= 200:
                             raise TimeoutError("200 combined TinyFish attempts reached.") from error
                         if any(
@@ -403,11 +651,56 @@ class ProductResearch:
                             raise TimeoutError(message) from error
                 after = (len(self.known), len(self.pages), len(self.candidates))
                 idle = idle + 1 if before == after else 0
+                if turn.done and not turn.actions and not action_failed:
+                    pending = [
+                        url
+                        for url, result in self.known.items()
+                        if result["domain"] in self.domains
+                        and self.domains[result["domain"]]["searches"] > 0
+                        and self.domains[result["domain"]]["fetches"] < 10
+                        and url not in self.attempted
+                    ]
+                    if pending:
+                        # A relevant domain's search results are not evidence until its
+                        # actual candidate pages have been inspected. Drain in bounded
+                        # batches, then let Gemini evaluate the new page content.
+                        self.last_results = []
+                        for url in pending[:5]:
+                            try:
+                                self.last_results.append(self.fetch(url))
+                            except (ScoutError, ValueError) as error:
+                                message = str(error)
+                                self.last_results.append({"error": message})
+                                self.warnings.append(message)
+                                self.partial = True
+                                if self.stop_reason == "completed":
+                                    self.stop_reason = "Some listing pages could not be checked."
+                                if any(
+                                    word in message.lower()
+                                    for word in (
+                                        "allowance exhausted",
+                                        "daily limit",
+                                        "rate limit",
+                                        "rejected the key",
+                                    )
+                                ):
+                                    self.stop_reason = message
+                                    break
+                        if any(item.get("operation") == "fetch" for item in self.last_results):
+                            continue
+                    if self.known and not self.pages:
+                        self.partial = True
+                        self.stop_reason = (
+                            "Search results were found, but no product pages were checked."
+                        )
+                    break
                 if idle >= 3:
                     raise TimeoutError("Stopped after three rounds without new usable evidence.")
         except (ScoutError, ValueError, TimeoutError) as error:
             self.partial, self.stop_reason = True, str(error)
             self.warnings.append(self.stop_reason)
+        if not self.candidates and self.excluded and not self.partial:
+            self.stop_reason = "No products met all hard requirements based on the pages checked."
         return self.result(request)
 
     def result(self, request: str) -> dict:
@@ -513,7 +806,11 @@ class ProductResearch:
             "stop_reason": self.stop_reason,
             "country": self.plan.country,
             "scope": self.plan.scope,
+            "constraints": [item.model_dump() for item in self.plan.constraints],
+            "preferences": self.plan.preferences,
             "searches": self.budget.searches,
+            "discovery_searches": self.discovery_searches,
+            "search_queries": self.search_log,
             "fetches": self.budget.fetches,
             "limit": 200,
             "domains": list(self.domains.values()),
